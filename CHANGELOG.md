@@ -1,3 +1,26 @@
+3.0.0-beta.3
+------------
+* add typescript definitions #81 thanks @enko!
+* fix a bug (https://github.com/tyrasd/overpass-turbo/issues/353) where duplicate multipolygon members in input produced wrong and broken geojson output
+
+3.0.0-beta.2
+------------
+* output linestrings for waterway relations, too
+* improve handling of data with duplicate osm objects
+
+3.0.0-beta.1
+------------
+* make multipolygon/route handlers robust against empty members
+
+3.0.0-beta.0
+------------
+* (breaking) objects are by default returned with flat (un-nested) properties ("flatProperties" option is enabled by default)
+* create (Multi)LineString features for route relations
+* add pbf file support
+* add newline delimited GeoJSON output mode (ndjson compatible)
+* new API option: feature callback for custom output
+* new API option: allow customized object deduplication handling
+
 2.2.12
 ------
 backported from 3.0.0-dev: de-namespace full geometry content in output (internal state leak)

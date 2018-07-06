@@ -21,7 +21,7 @@ function default_deduplicator(objectA, objectB) {
   // if object versions differ, use highest available version
   if ((objectA.version || objectB.version) &&
       (objectA.version !== objectB.version)) {
-    return (objectA.version || 0) > (objectB.version || 0)
+    return (+objectA.version || 0) > (+objectB.version || 0)
       ? objectA
       : objectB;
   }
@@ -31,12 +31,12 @@ function default_deduplicator(objectA, objectB) {
 
 var osmtogeojson = {};
 
-osmtogeojson = function( data, options ) {
+osmtogeojson = function( data, options, featureCallback ) {
 
   options = _.merge(
     {
       verbose: false,
-      flatProperties: false,
+      flatProperties: true,
       uninterestingTags: {
         "source": true,
         "source_ref": true,
@@ -567,9 +567,7 @@ osmtogeojson = function( data, options ) {
     }
     // construct geojson
     var geojson;
-    var geojsonnodes = {
-      "type"     : "FeatureCollection",
-      "features" : new Array()};
+    var geojsonnodes = [];
     for (i=0;i<pois.length;i++) {
       if (typeof pois[i].lon == "undefined" || typeof pois[i].lat == "undefined") {
         if (options.verbose) console.warn('POI',pois[i].type+'/'+pois[i].id,'ignored because it lacks coordinates');
@@ -592,14 +590,13 @@ osmtogeojson = function( data, options ) {
       };
       if (pois[i].__is_center_placeholder)
         feature.properties["geometry"] = "center";
-      geojsonnodes.features.push(feature);
+      if (!featureCallback)
+        geojsonnodes.push(feature);
+      else
+        featureCallback(feature);
     }
-    var geojsonlines = {
-      "type"     : "FeatureCollection",
-      "features" : new Array()};
-    var geojsonpolygons = {
-      "type"     : "FeatureCollection",
-      "features" : new Array()};
+    var geojsonlines = [];
+    var geojsonpolygons = [];
     // process multipolygons
     for (var i=0;i<rels.length;i++) {
       // todo: refactor such that this loops over relids instead of rels?
@@ -607,6 +604,92 @@ osmtogeojson = function( data, options ) {
         // skip relation because it's a deduplication artifact
         continue;
       }
+      if ((typeof rels[i].tags != "undefined") &&
+          (rels[i].tags["type"] == "route" || rels[i].tags["type"] == "waterway")) {
+        if (!_.isArray(rels[i].members)) {
+          if (options.verbose) console.warn('Route',rels[i].type+'/'+rels[i].id,'ignored because it has no members');
+          continue; // ignore relations without members (e.g. returned by an ids_only query)
+        }
+        rels[i].members.forEach(function(m) {
+          if (wayids[m.ref] && !has_interesting_tags(wayids[m.ref].tags))
+              wayids[m.ref].is_skippablerelationmember = true;
+        });
+        feature = construct_multilinestring(rels[i]);
+        if (feature === false) {
+          if (options.verbose) console.warn('Route relation',rels[i].type+'/'+rels[i].id,'ignored because it has invalid geometry');
+          continue; // abort if feature could not be constructed
+        }
+        if (!featureCallback)
+          geojsonpolygons.push(feature);
+        else
+          featureCallback(rewind(feature));
+
+        function construct_multilinestring(rel) {
+          var is_tainted = false;
+          // prepare route members
+          var members;
+          members = rel.members.filter(function(m) {return m.type === "way";});
+          members = members.map(function(m) {
+            var way = wayids[m.ref];
+            if (way === undefined || way.nodes === undefined) { // check for missing ways
+              if (options.verbose) console.warn('Route '+rel.type+'/'+rel.id, 'tainted by a missing or incomplete  way', m.type+'/'+m.ref);
+              is_tainted = true;
+              return;
+            }
+            return { // TODO: this is slow! :(
+              id: m.ref,
+              role: m.role,
+              way: way,
+              nodes: way.nodes.filter(function(n) {
+                if (n !== undefined)
+                  return true;
+                is_tainted = true;
+                if (options.verbose) console.warn('Route', rel.type+'/'+rel.id,  'tainted by a way', m.type+'/'+m.ref, 'with a missing node');
+                return false;
+              })
+            };
+          });
+          members = _.compact(members);
+          // construct connected linestrings
+          var linestrings;
+          linestrings = join(members);
+
+          // sanitize mp-coordinates (remove empty clusters or rings, {lat,lon,...} to [lon,lat]
+          var coords = [];
+          coords = _.compact(linestrings.map(function(linestring) {
+            return _.compact(linestring.map(function(node) {
+              return [+node.lon,+node.lat];
+            }));
+          }));
+
+          if (coords.length == 0) {
+            if (options.verbose) console.warn('Route', rel.type+'/'+rel.id, 'contains no coordinates');
+            return false; // ignore routes without coordinates
+          }
+
+          // mp parsed, now construct the geoJSON
+          var feature = {
+            "type"       : "Feature",
+            "id"         : rel.type+"/"+rel.id,
+            "properties" : {
+              "type" : rel.type,
+              "id"   : rel.id,
+              "tags" : rel.tags || {},
+              "relations" :  relsmap[rel.type][rel.id] || [],
+              "meta": build_meta_information(rel)
+            },
+            "geometry"   : {
+              "type" : coords.length === 1 ? "LineString" : "MultiLineString",
+              "coordinates" : coords.length === 1 ? coords[0] : coords,
+            }
+          }
+          if (is_tainted) {
+            if (options.verbose) console.warn('Route', rel.type+'/'+rel.id, 'is tainted');
+            feature.properties["tainted"] = true;
+          }
+          return feature;
+        }
+      } // end construct multilinestring for route relations
       if ((typeof rels[i].tags != "undefined") &&
           (rels[i].tags["type"] == "multipolygon" || rels[i].tags["type"] == "boundary")) {
         if (!_.isArray(rels[i].members)) {
@@ -625,9 +708,9 @@ osmtogeojson = function( data, options ) {
             // a multipolygon amenity=xxx with outer line tagged amenity=yyy
             // see https://github.com/tyrasd/osmtogeojson/issues/7
             if (m.role==="outer" && !has_interesting_tags(wayids[m.ref].tags,rels[i].tags))
-              wayids[m.ref].is_multipolygon_outline = true;
+              wayids[m.ref].is_skippablerelationmember = true;
             if (m.role==="inner" && !has_interesting_tags(wayids[m.ref].tags))
-              wayids[m.ref].is_multipolygon_outline = true;
+              wayids[m.ref].is_skippablerelationmember = true;
           }
         });
         if (outer_count == 0) {
@@ -648,14 +731,18 @@ osmtogeojson = function( data, options ) {
             if (options.verbose) console.warn('Multipolygon relation',rels[i].type+'/'+rels[i].id,'ignored because outer way', outer_way.type+'/'+outer_way.ref,'is missing');
             continue; // abort if outer way object is not present
           }
-          outer_way.is_multipolygon_outline = true;
+          outer_way.is_skippablerelationmember = true;
           feature = construct_multipolygon(outer_way, rels[i]);
         }
         if (feature === false) {
           if (options.verbose) console.warn('Multipolygon relation',rels[i].type+'/'+rels[i].id,'ignored because it has invalid geometry');
           continue; // abort if feature could not be constructed
         }
-        geojsonpolygons.features.push(feature);
+        if (!featureCallback)
+          geojsonpolygons.push(feature);
+        else
+          featureCallback(rewind(feature));
+
         function construct_multipolygon(tag_object, rel) {
           var is_tainted = false;
           var mp_geometry = simple_mp ? 'way' : 'relation',
@@ -665,8 +752,8 @@ osmtogeojson = function( data, options ) {
           members = rel.members.filter(function(m) {return m.type === "way";});
           members = members.map(function(m) {
             var way = wayids[m.ref];
-            if (way === undefined) { // check for missing ways
-              if (options.verbose) console.warn('Multipolygon', mp_geometry+'/'+mp_id, 'tainted by a missing way', m.type+'/'+m.ref);
+            if (way === undefined || way.nodes === undefined) { // check for missing ways
+              if (options.verbose) console.warn('Multipolygon', mp_geometry+'/'+mp_id, 'tainted by a missing or incomplete way', m.type+'/'+m.ref);
               is_tainted = true;
               return;
             }
@@ -686,49 +773,6 @@ osmtogeojson = function( data, options ) {
           members = _.compact(members);
           // construct outer and inner rings
           var outers, inners;
-          function join(ways) {
-            var _first = function(arr) {return arr[0]};
-            var _last  = function(arr) {return arr[arr.length-1]};
-            // stolen from iD/relation.js
-            var joined = [], current, first, last, i, how, what;
-            while (ways.length) {
-              current = ways.pop().nodes.slice();
-              joined.push(current);
-              while (ways.length && _first(current) !== _last(current)) {
-                first = _first(current);
-                last  = _last(current);
-                for (i = 0; i < ways.length; i++) {
-                  what = ways[i].nodes;
-                  if (last === _first(what)) {
-                    how  = current.push;
-                    what = what.slice(1);
-                    break;
-                  } else if (last === _last(what)) {
-                    how  = current.push;
-                    what = what.slice(0, -1).reverse();
-                    break;
-                  } else if (first == _last(what)) {
-                    how  = current.unshift;
-                    what = what.slice(0, -1);
-                    break;
-                  } else if (first == _first(what)) {
-                    how  = current.unshift;
-                    what = what.slice(1).reverse();
-                    break;
-                  } else {
-                    what = how = null;
-                  }
-                }
-                if (!what) {
-                  if (options.verbose) console.warn('Multipolygon', mp_geometry+'/'+mp_id, 'contains unclosed ring geometry');
-                  break; // Invalid geometry (dangling way, unclosed ring)
-                }
-                ways.splice(i, 1);
-                how.apply(current, what);
-              }
-            }
-            return joined;
-          }
           outers = join(members.filter(function(m) {return m.role==="outer";}));
           inners = join(members.filter(function(m) {return m.role==="inner";}));
           // sort rings
@@ -849,7 +893,7 @@ osmtogeojson = function( data, options ) {
         if (options.verbose) console.warn('Way',ways[i].type+'/'+ways[i].id,'ignored because it has no nodes');
         continue; // ignore ways without nodes (e.g. returned by an ids_only query)
       }
-      if (ways[i].is_multipolygon_outline)
+      if (ways[i].is_skippablerelationmember)
         continue; // ignore ways which are already rendered as (part of) a multipolygon
       if (typeof ways[i].id !== "number") {
         // remove full geometry namespace for output
@@ -871,8 +915,8 @@ osmtogeojson = function( data, options ) {
         continue;
       }
       var way_type = "LineString"; // default
-      if (typeof ways[i].nodes[0] != "undefined" && // way has its nodes loaded
-        ways[i].nodes[0] === ways[i].nodes[ways[i].nodes.length-1] && // ... and forms a closed ring
+      if (typeof ways[i].nodes[0] != "undefined" && typeof ways[i].nodes[ways[i].nodes.length-1] != "undefined" && // way has its start/end nodes loaded
+        ways[i].nodes[0].id === ways[i].nodes[ways[i].nodes.length-1].id && // ... and forms a closed ring
         (
           typeof ways[i].tags != "undefined" && // ... and has tags
           _isPolygonFeature(ways[i].tags) // ... and tags say it is a polygon
@@ -904,19 +948,26 @@ osmtogeojson = function( data, options ) {
       }
       if (ways[i].__is_bounds_placeholder)
         feature.properties["geometry"] = "bounds";
-      if (way_type == "LineString")
-        geojsonlines.features.push(feature);
-      else
-        geojsonpolygons.features.push(feature);
+      if (!featureCallback) {
+        if (way_type == "LineString")
+          geojsonlines.push(feature);
+        else
+          geojsonpolygons.push(feature);
+      } else {
+        featureCallback(rewind(feature));
+      }
     }
+
+    if (featureCallback)
+      return true;
 
     geojson = {
       "type": "FeatureCollection",
       "features": []
     };
-    geojson.features = geojson.features.concat(geojsonpolygons.features);
-    geojson.features = geojson.features.concat(geojsonlines.features);
-    geojson.features = geojson.features.concat(geojsonnodes.features);
+    geojson.features = geojson.features.concat(geojsonpolygons);
+    geojson.features = geojson.features.concat(geojsonlines);
+    geojson.features = geojson.features.concat(geojsonnodes);
     // optionally, flatten properties
     if (options.flatProperties) {
       geojson.features.forEach(function(f) {
@@ -928,7 +979,7 @@ osmtogeojson = function( data, options ) {
       });
     }
     // fix polygon winding
-    geojson = rewind(geojson, true /*remove for geojson-rewind >0.1.0*/);
+    geojson = rewind(geojson);
     return geojson;
   }
   function _isPolygonFeature( tags ) {
@@ -961,6 +1012,52 @@ osmtogeojson = function( data, options ) {
     return false;
   }
 };
+
+// helper that joins adjacent osm ways into linestrings or linear rings
+function join(ways) {
+  var _first = function(arr) {return arr[0]};
+  var _last  = function(arr) {return arr[arr.length-1]};
+  var _fitTogether = function(n1, n2) {
+    return n1 !== undefined && n2 !== undefined && n1.id === n2.id;
+  }
+  // stolen from iD/relation.js
+  var joined = [], current, first, last, i, how, what;
+  while (ways.length) {
+    current = ways.pop().nodes.slice();
+    joined.push(current);
+    while (ways.length && !_fitTogether(_first(current), _last(current))) {
+      first = _first(current);
+      last  = _last(current);
+      for (i = 0; i < ways.length; i++) {
+        what = ways[i].nodes;
+        if (_fitTogether(last, _first(what))) {
+          how  = current.push;
+          what = what.slice(1);
+          break;
+        } else if (_fitTogether(last, _last(what))) {
+          how  = current.push;
+          what = what.slice(0, -1).reverse();
+          break;
+        } else if (_fitTogether(first, _last(what))) {
+          how  = current.unshift;
+          what = what.slice(0, -1);
+          break;
+        } else if (_fitTogether(first, _first(what))) {
+          how  = current.unshift;
+          what = what.slice(1).reverse();
+          break;
+        } else {
+          what = how = null;
+        }
+      }
+      if (!what)
+        break; // Invalid geometry (dangling way, unclosed ring)
+      ways.splice(i, 1);
+      how.apply(current, what);
+    }
+  }
+  return joined;
+}
 
 // for backwards compatibility
 osmtogeojson.toGeojson = osmtogeojson;
